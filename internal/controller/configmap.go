@@ -18,7 +18,6 @@ func NewConfigMapReconciler(c client.Client, mirrors cache.Cache) *MirrorReconci
 	}
 }
 
-// configMapAdapter implements Adapter for ConfigMaps.
 type configMapAdapter struct{}
 
 func (configMapAdapter) New() *corev1.ConfigMap { return &corev1.ConfigMap{} }

@@ -6,9 +6,6 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// targetNamespaces returns the namespaces obj should be mirrored into, parsed
-// from the comma separated kube-mirror.io/target-namespaces annotation.
-// Whitespace is trimmed; empty entries and obj's own namespace are skipped.
 func targetNamespaces(obj metav1.Object) []string {
 	raw := obj.GetAnnotations()[AnnotationTargetNamespaces]
 

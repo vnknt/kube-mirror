@@ -19,7 +19,6 @@ func NewSecretReconciler(c client.Client, mirrors cache.Cache) *MirrorReconciler
 	}
 }
 
-// secretAdapter implements Adapter for Secrets.
 type secretAdapter struct{}
 
 func (secretAdapter) New() *corev1.Secret { return &corev1.Secret{} }
@@ -29,8 +28,7 @@ func (secretAdapter) CopyData(dst, src *corev1.Secret) {
 	dst.Data = maps.Clone(src.Data)
 }
 
-// CanUpdate rejects type changes: a Secret's type is immutable after creation,
-// so updating it would fail on every retry.
+// A Secret's type is immutable; updating it would fail on every retry.
 func (secretAdapter) CanUpdate(dst, src *corev1.Secret) (bool, string) {
 	if dst.Type != src.Type {
 		return false, fmt.Sprintf("secret type changed from %q to %q and is immutable", dst.Type, src.Type)

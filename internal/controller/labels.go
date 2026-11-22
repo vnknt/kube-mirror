@@ -7,6 +7,10 @@ const (
 
 	AnnotationTargetNamespaces = Prefix + "target-namespaces"
 
+	AnnotationDeletionPolicy = Prefix + "deletion-policy"
+	DeletionPolicyDelete     = "Delete" // default
+	DeletionPolicyRetain     = "Retain"
+
 	AnnotationSource = Prefix + "source"
 
 	LabelManagedBy = "app.kubernetes.io/managed-by"

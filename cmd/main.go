@@ -32,7 +32,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// The manager's cache only holds sources.
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
 		Metrics: metricsserver.Options{BindAddress: metricsAddr},
 		Cache:   mirroredKindsWithLabel(controller.LabelEnabled, "true"),
@@ -70,9 +69,8 @@ func main() {
 	}
 }
 
-// newMirrorCluster returns a second cluster whose cache holds the copies kube-mirror
-// creates. It is needed because one cache allows only one label selector per type,
-// and the manager's cache is already filtered to sources.
+// newMirrorCluster returns a cluster whose cache holds kube-mirror's copies.
+// A separate cache is needed because a cache allows one label selector per type.
 func newMirrorCluster(cfg *rest.Config, mgr ctrl.Manager) (cluster.Cluster, error) {
 	return cluster.New(cfg, func(o *cluster.Options) {
 		o.Scheme = mgr.GetScheme()
@@ -81,9 +79,7 @@ func newMirrorCluster(cfg *rest.Config, mgr ctrl.Manager) (cluster.Cluster, erro
 	})
 }
 
-// mirroredKindsWithLabel returns cache options that only cache Secrets and
-// ConfigMaps labeled key=value. The selector is sent to the API server, so
-// other objects of these kinds never reach us.
+// mirroredKindsWithLabel caches only Secrets and ConfigMaps labeled key=value.
 func mirroredKindsWithLabel(key, value string) cache.Options {
 	selector := labels.SelectorFromSet(labels.Set{key: value})
 	return cache.Options{
