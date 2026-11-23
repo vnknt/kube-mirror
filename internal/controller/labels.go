@@ -7,6 +7,8 @@ const (
 
 	AnnotationTargetNamespaces = Prefix + "target-namespaces"
 
+	LabelAccept = Prefix + "accept"
+
 	AnnotationDeletionPolicy = Prefix + "deletion-policy"
 	DeletionPolicyDelete     = "Delete" // default
 	DeletionPolicyRetain     = "Retain"

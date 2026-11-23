@@ -25,6 +25,8 @@ import (
 // indexSource indexes copies in the mirror cache by their kube-mirror.io/source value.
 const indexSource = "kube-mirror.io/source"
 
+var errNotAccepted = errors.New("namespace does not accept mirrors")
+
 // Adapter provides the kind-specific parts of mirroring.
 type Adapter[T client.Object] interface {
 	New() T
@@ -64,8 +66,14 @@ func (r *MirrorReconciler[T]) Reconcile(ctx context.Context, req ctrl.Request) (
 	var errs []error
 	keep := make(map[string]bool, len(targets))
 	for _, ns := range targets {
+		err := r.syncTo(ctx, src, ns)
+		if errors.Is(err, errNotAccepted) {
+			r.Recorder.Eventf(src, nil, corev1.EventTypeWarning, "TargetNotAllowed", "Sync",
+				"namespace %q does not accept mirrors (missing label %s=true)", ns, LabelAccept)
+			continue
+		}
 		keep[ns] = true
-		if err := r.syncTo(ctx, src, ns); err != nil {
+		if err != nil {
 			r.Recorder.Eventf(src, nil, corev1.EventTypeWarning, "SyncFailed", "Sync",
 				"sync to namespace %q failed: %v", ns, err)
 			errs = append(errs, fmt.Errorf("sync to namespace %q: %w", ns, err))
@@ -153,6 +161,10 @@ func (r *MirrorReconciler[T]) namespaceReady(ctx context.Context, ns string) (bo
 	if namespace.Status.Phase == corev1.NamespaceTerminating {
 		logger.Info("target namespace is terminating, skipping")
 		return false, nil
+	}
+	if namespace.Labels[LabelAccept] != "true" {
+		logger.Info("target namespace does not accept mirrors, skipping")
+		return false, errNotAccepted
 	}
 	return true, nil
 }
