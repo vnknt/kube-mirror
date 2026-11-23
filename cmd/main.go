@@ -53,11 +53,12 @@ func main() {
 	}
 
 	mirrors := mirrorCluster.GetCache()
-	if err := controller.NewSecretReconciler(mgr.GetClient(), mirrors).SetupWithManager(mgr); err != nil {
+	rec := mgr.GetEventRecorder("kube-mirror")
+	if err := controller.NewSecretReconciler(mgr.GetClient(), mirrors, rec).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to create controller", "controller", "secret")
 		os.Exit(1)
 	}
-	if err := controller.NewConfigMapReconciler(mgr.GetClient(), mirrors).SetupWithManager(mgr); err != nil {
+	if err := controller.NewConfigMapReconciler(mgr.GetClient(), mirrors, rec).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to create controller", "controller", "configmap")
 		os.Exit(1)
 	}

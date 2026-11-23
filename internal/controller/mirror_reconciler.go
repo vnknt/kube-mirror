@@ -9,6 +9,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
+	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
@@ -16,12 +18,17 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
+	"sigs.k8s.io/controller-runtime/pkg/recorder"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 )
+
+// indexSource indexes copies in the mirror cache by their kube-mirror.io/source value.
+const indexSource = "kube-mirror.io/source"
 
 // Adapter provides the kind-specific parts of mirroring.
 type Adapter[T client.Object] interface {
 	New() T
+	NewList() client.ObjectList
 	CopyData(dst, src T)
 	CanUpdate(dst, src T) (ok bool, reason string)
 }
@@ -33,8 +40,9 @@ type MirrorReconciler[T client.Object] struct {
 	// Mirrors caches kube-mirror's copies; the embedded Client only sees sources.
 	Mirrors cache.Cache
 	// Name is the controller name and must be unique per manager.
-	Name    string
-	Adapter Adapter[T]
+	Name     string
+	Adapter  Adapter[T]
+	Recorder recorder.EventRecorder
 }
 
 // Reconcile syncs a source to its targets. It also runs when one of its copies changes.
@@ -44,8 +52,8 @@ func (r *MirrorReconciler[T]) Reconcile(ctx context.Context, req ctrl.Request) (
 	src := r.Adapter.New()
 	if err := r.Get(ctx, req.NamespacedName, src); err != nil {
 		if apierrors.IsNotFound(err) {
-			logger.Info("source not found (deleted or unlabeled)")
-			return ctrl.Result{}, nil
+			logger.Info("source not found (deleted or unlabeled), cleaning up copies")
+			return ctrl.Result{}, r.deleteCopies(ctx, nil, req.NamespacedName, nil, retainPolicy)
 		}
 		return ctrl.Result{}, err
 	}
@@ -54,12 +62,63 @@ func (r *MirrorReconciler[T]) Reconcile(ctx context.Context, req ctrl.Request) (
 	logger.Info("reconciling", "targets", targets)
 
 	var errs []error
+	keep := make(map[string]bool, len(targets))
 	for _, ns := range targets {
+		keep[ns] = true
 		if err := r.syncTo(ctx, src, ns); err != nil {
+			r.Recorder.Eventf(src, nil, corev1.EventTypeWarning, "SyncFailed", "Sync",
+				"sync to namespace %q failed: %v", ns, err)
 			errs = append(errs, fmt.Errorf("sync to namespace %q: %w", ns, err))
 		}
 	}
+
+	retain := retainPolicy(src)
+	if err := r.deleteCopies(ctx, src, req.NamespacedName, keep,
+		func(client.Object) bool { return retain }); err != nil {
+		errs = append(errs, err)
+	}
 	return ctrl.Result{}, errors.Join(errs...)
+}
+
+// deleteCopies deletes the copies of srcKey outside the keep namespaces,
+// except those for which retain returns true. A nil keep matches all copies.
+// Events go to src; it is nil when the source is gone.
+func (r *MirrorReconciler[T]) deleteCopies(ctx context.Context, src client.Object, srcKey types.NamespacedName,
+	keep map[string]bool, retain func(client.Object) bool) error {
+	logger := log.FromContext(ctx)
+
+	copies := r.Adapter.NewList()
+	if err := r.Mirrors.List(ctx, copies, client.MatchingFields{indexSource: srcKey.String()}); err != nil {
+		return err
+	}
+
+	var errs []error
+	err := meta.EachListItem(copies, func(o runtime.Object) error {
+		dst := o.(client.Object)
+		target := client.ObjectKeyFromObject(dst)
+
+		if keep[dst.GetNamespace()] {
+			return nil
+		}
+		if retain(dst) {
+			logger.V(1).Info("retaining copy", "copy", target)
+			return nil
+		}
+		if err := r.Delete(ctx, dst); client.IgnoreNotFound(err) != nil {
+			errs = append(errs, fmt.Errorf("delete copy %s: %w", target, err))
+			return nil
+		}
+		logger.Info("copy deleted", "copy", target)
+		if src != nil {
+			r.Recorder.Eventf(src, nil, corev1.EventTypeNormal, "CopyDeleted", "Delete",
+				"deleted copy in namespace %q", dst.GetNamespace())
+		}
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	return errors.Join(errs...)
 }
 
 func (r *MirrorReconciler[T]) syncTo(ctx context.Context, src T, ns string) error {
@@ -123,11 +182,15 @@ func (r *MirrorReconciler[T]) createCopy(ctx context.Context, src T, ns string) 
 	if err := r.Create(ctx, dst); err != nil {
 		if apierrors.IsAlreadyExists(err) {
 			logger.Info("object exists and is not managed by kube-mirror, skipping")
+			r.Recorder.Eventf(src, nil, corev1.EventTypeWarning, "TargetExists", "Create",
+				"namespace %q already has an object named %q not managed by kube-mirror", ns, src.GetName())
 			return nil
 		}
 		return err
 	}
 	logger.Info("copy created")
+	r.Recorder.Eventf(src, nil, corev1.EventTypeNormal, "CopyCreated", "Create",
+		"copied to namespace %q", ns)
 	return nil
 }
 
@@ -136,10 +199,14 @@ func (r *MirrorReconciler[T]) updateCopy(ctx context.Context, dst, src T) error 
 
 	if owner := dst.GetAnnotations()[AnnotationSource]; owner != sourceKey(src) {
 		logger.Info("copy belongs to another source, skipping", "owner", owner)
+		r.Recorder.Eventf(src, nil, corev1.EventTypeWarning, "TargetConflict", "Update",
+			"copy in namespace %q belongs to source %q", dst.GetNamespace(), owner)
 		return nil
 	}
 	if ok, reason := r.Adapter.CanUpdate(dst, src); !ok {
 		logger.Info("copy cannot be updated in place, skipping", "reason", reason)
+		r.Recorder.Eventf(src, nil, corev1.EventTypeWarning, "UpdateBlocked", "Update",
+			"copy in namespace %q not updated: %s", dst.GetNamespace(), reason)
 		return nil
 	}
 
@@ -152,6 +219,8 @@ func (r *MirrorReconciler[T]) updateCopy(ctx context.Context, dst, src T) error 
 		return err
 	}
 	logger.Info("copy updated")
+	r.Recorder.Eventf(src, nil, corev1.EventTypeNormal, "CopyUpdated", "Update",
+		"updated copy in namespace %q", dst.GetNamespace())
 	return nil
 }
 
@@ -169,9 +238,7 @@ func (r *MirrorReconciler[T]) applySource(dst, src T) {
 		annotations = map[string]string{}
 	}
 	annotations[AnnotationSource] = sourceKey(src)
-	// Only Retain is stamped; absence means the default (Delete). Removing it
-	// also covers a source that switched from Retain back to the default.
-	if src.GetAnnotations()[AnnotationDeletionPolicy] == DeletionPolicyRetain {
+	if retainPolicy(src) {
 		annotations[AnnotationDeletionPolicy] = DeletionPolicyRetain
 	} else {
 		delete(annotations, AnnotationDeletionPolicy)
@@ -193,12 +260,27 @@ func (r *MirrorReconciler[T]) mapCopyToSource(_ context.Context, dst T) []reconc
 
 // SetupWithManager registers this reconciler with the manager.
 func (r *MirrorReconciler[T]) SetupWithManager(mgr ctrl.Manager) error {
+	err := r.Mirrors.IndexField(context.Background(), r.Adapter.New(), indexSource,
+		func(o client.Object) []string {
+			if v := o.GetAnnotations()[AnnotationSource]; v != "" {
+				return []string{v}
+			}
+			return nil
+		})
+	if err != nil {
+		return fmt.Errorf("index copies by source: %w", err)
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(r.Adapter.New()).
 		WatchesRawSource(source.Kind(r.Mirrors, r.Adapter.New(),
 			handler.TypedEnqueueRequestsFromMapFunc(r.mapCopyToSource))).
 		Named(r.Name).
 		Complete(r)
+}
+
+func retainPolicy(obj client.Object) bool {
+	return obj.GetAnnotations()[AnnotationDeletionPolicy] == DeletionPolicyRetain
 }
 
 func sourceKey(src client.Object) string {

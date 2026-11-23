@@ -7,21 +7,25 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/recorder"
 )
 
 // NewSecretReconciler returns a reconciler that mirrors Secrets (including TLS certificates).
-func NewSecretReconciler(c client.Client, mirrors cache.Cache) *MirrorReconciler[*corev1.Secret] {
+func NewSecretReconciler(c client.Client, mirrors cache.Cache, rec recorder.EventRecorder) *MirrorReconciler[*corev1.Secret] {
 	return &MirrorReconciler[*corev1.Secret]{
-		Client:  c,
-		Mirrors: mirrors,
-		Name:    "secret",
-		Adapter: secretAdapter{},
+		Client:   c,
+		Mirrors:  mirrors,
+		Recorder: rec,
+		Name:     "secret",
+		Adapter:  secretAdapter{},
 	}
 }
 
 type secretAdapter struct{}
 
 func (secretAdapter) New() *corev1.Secret { return &corev1.Secret{} }
+
+func (secretAdapter) NewList() client.ObjectList { return &corev1.SecretList{} }
 
 func (secretAdapter) CopyData(dst, src *corev1.Secret) {
 	dst.Type = src.Type
