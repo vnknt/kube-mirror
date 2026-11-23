@@ -13,17 +13,22 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
 	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 	"sigs.k8s.io/controller-runtime/pkg/recorder"
 	"sigs.k8s.io/controller-runtime/pkg/source"
 )
 
-// indexSource indexes copies in the mirror cache by their kube-mirror.io/source value.
-const indexSource = "kube-mirror.io/source"
+const (
+	indexCopySource      = "copySource"
+	indexTargetNamespace = "targetNamespace"
+)
 
 var errNotAccepted = errors.New("namespace does not accept mirrors")
 
@@ -96,7 +101,7 @@ func (r *MirrorReconciler[T]) deleteCopies(ctx context.Context, src client.Objec
 	logger := log.FromContext(ctx)
 
 	copies := r.Adapter.NewList()
-	if err := r.Mirrors.List(ctx, copies, client.MatchingFields{indexSource: srcKey.String()}); err != nil {
+	if err := r.Mirrors.List(ctx, copies, client.MatchingFields{indexCopySource: srcKey.String()}); err != nil {
 		return err
 	}
 
@@ -270,9 +275,41 @@ func (r *MirrorReconciler[T]) mapCopyToSource(_ context.Context, dst T) []reconc
 	return []reconcile.Request{{NamespacedName: key}}
 }
 
+// mapNamespaceToSources enqueues the sources that target a namespace.
+func (r *MirrorReconciler[T]) mapNamespaceToSources(ctx context.Context, ns client.Object) []reconcile.Request {
+	logger := log.FromContext(ctx).WithValues("targetNamespace", ns.GetName())
+
+	sources := r.Adapter.NewList()
+	if err := r.List(ctx, sources, client.MatchingFields{indexTargetNamespace: ns.GetName()}); err != nil {
+		logger.Error(err, "unable to list sources targeting namespace")
+		return nil
+	}
+
+	var reqs []reconcile.Request
+	err := meta.EachListItem(sources, func(o runtime.Object) error {
+		reqs = append(reqs, reconcile.Request{NamespacedName: client.ObjectKeyFromObject(o.(client.Object))})
+		return nil
+	})
+	if err != nil {
+		logger.Error(err, "unable to read sources targeting namespace")
+		return nil
+	}
+	return reqs
+}
+
+// acceptChanged passes new namespaces and changes to their accept label.
+// Deleted namespaces take their copies with them, so they need no reconcile.
+var acceptChanged = predicate.Funcs{
+	UpdateFunc: func(e event.UpdateEvent) bool {
+		return e.ObjectOld.GetLabels()[LabelAccept] != e.ObjectNew.GetLabels()[LabelAccept]
+	},
+	DeleteFunc:  func(event.DeleteEvent) bool { return false },
+	GenericFunc: func(event.GenericEvent) bool { return false },
+}
+
 // SetupWithManager registers this reconciler with the manager.
 func (r *MirrorReconciler[T]) SetupWithManager(mgr ctrl.Manager) error {
-	err := r.Mirrors.IndexField(context.Background(), r.Adapter.New(), indexSource,
+	err := r.Mirrors.IndexField(context.Background(), r.Adapter.New(), indexCopySource,
 		func(o client.Object) []string {
 			if v := o.GetAnnotations()[AnnotationSource]; v != "" {
 				return []string{v}
@@ -283,10 +320,19 @@ func (r *MirrorReconciler[T]) SetupWithManager(mgr ctrl.Manager) error {
 		return fmt.Errorf("index copies by source: %w", err)
 	}
 
+	err = mgr.GetFieldIndexer().IndexField(context.Background(), r.Adapter.New(), indexTargetNamespace,
+		func(o client.Object) []string { return targetNamespaces(o) })
+	if err != nil {
+		return fmt.Errorf("index sources by target namespace: %w", err)
+	}
+
 	return ctrl.NewControllerManagedBy(mgr).
 		For(r.Adapter.New()).
 		WatchesRawSource(source.Kind(r.Mirrors, r.Adapter.New(),
 			handler.TypedEnqueueRequestsFromMapFunc(r.mapCopyToSource))).
+		Watches(&corev1.Namespace{},
+			handler.EnqueueRequestsFromMapFunc(r.mapNamespaceToSources),
+			builder.WithPredicates(acceptChanged)).
 		Named(r.Name).
 		Complete(r)
 }
