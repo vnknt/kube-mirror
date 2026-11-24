@@ -11,6 +11,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/cluster"
+	"sigs.k8s.io/controller-runtime/pkg/healthz"
 	"sigs.k8s.io/controller-runtime/pkg/log/zap"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
@@ -18,12 +19,22 @@ import (
 )
 
 func main() {
-	var metricsAddr string
+	var (
+		metricsAddr    string
+		probeAddr      string
+		leaderElection bool
+	)
 	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080",
 		`Address the metrics endpoint binds to. Use "0" to disable.`)
+	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081",
+		"Address the health probe endpoint binds to.")
+	flag.BoolVar(&leaderElection, "leader-elect", false,
+		"Enable leader election so that only one replica reconciles at a time.")
+	logOpts := zap.Options{}
+	logOpts.BindFlags(flag.CommandLine)
 	flag.Parse()
 
-	ctrl.SetLogger(zap.New(zap.UseDevMode(true)))
+	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&logOpts)))
 	log := ctrl.Log.WithName("setup")
 
 	cfg, err := ctrl.GetConfig()
@@ -33,10 +44,13 @@ func main() {
 	}
 
 	mgr, err := ctrl.NewManager(cfg, ctrl.Options{
-		Metrics: metricsserver.Options{BindAddress: metricsAddr},
-		Cache:   mirroredKindsWithLabel(controller.LabelEnabled, "true"),
+		Metrics:                       metricsserver.Options{BindAddress: metricsAddr},
+		HealthProbeBindAddress:        probeAddr,
+		LeaderElection:                leaderElection,
+		LeaderElectionID:              "leader.kube-mirror.io",
+		LeaderElectionReleaseOnCancel: true,
+		Cache:                         mirroredKindsWithLabel(controller.LabelEnabled, "true"),
 	})
-
 	if err != nil {
 		log.Error(err, "unable to create manager")
 		os.Exit(1)
@@ -60,6 +74,15 @@ func main() {
 	}
 	if err := controller.NewConfigMapReconciler(mgr.GetClient(), mirrors, rec).SetupWithManager(mgr); err != nil {
 		log.Error(err, "unable to create controller", "controller", "configmap")
+		os.Exit(1)
+	}
+
+	if err := mgr.AddHealthzCheck("healthz", healthz.Ping); err != nil {
+		log.Error(err, "unable to set up health check")
+		os.Exit(1)
+	}
+	if err := mgr.AddReadyzCheck("readyz", healthz.Ping); err != nil {
+		log.Error(err, "unable to set up ready check")
 		os.Exit(1)
 	}
 
