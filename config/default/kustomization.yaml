@@ -1,0 +1,5 @@
+namespace: kube-mirror-system
+
+resources:
+  - ../rbac
+  - ../manager
