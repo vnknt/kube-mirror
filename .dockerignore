@@ -1,0 +1,7 @@
+# Only what the build needs is sent to Docker.
+*
+!Dockerfile
+!go.mod
+!go.sum
+!cmd/
+!internal/
